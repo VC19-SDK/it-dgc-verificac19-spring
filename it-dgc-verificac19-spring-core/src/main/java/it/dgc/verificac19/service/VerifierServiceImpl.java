@@ -227,7 +227,8 @@ public class VerifierServiceImpl implements VerifierService {
 
     if (!CollectionUtils.isEmpty(cert.getT())) {
       if (validationScanMode.equals(ValidationScanMode.BOOSTER_DGP)
-          || validationScanMode.equals(ValidationScanMode.SUPER_DGP)) {
+          || validationScanMode.equals(ValidationScanMode.SUPER_DGP)
+          || validationScanMode.equals(ValidationScanMode.SCHOOL)) {
         return CertificateStatus.NOT_VALID;
       }
 
@@ -309,22 +310,41 @@ public class VerifierServiceImpl implements VerifierService {
 
 
 
-      String recoveryCertEndDay =
-          isRecoveryBis ? getRecoveryCertPvEndDay() : getRecoveryCertEndDayUnified(countryCode);
-      String recoveryCertStartDay =
+      String endDaysToAdd = null;
+      if (validationScanMode.equals(ValidationScanMode.SCHOOL)) {
+        endDaysToAdd = getRecoveryCertEndDaySchool();
+      } else if (isRecoveryBis) {
+        endDaysToAdd = getRecoveryCertPvEndDay();
+      } else {
+        endDaysToAdd = getRecoveryCertEndDayUnified(countryCode);
+      }
+
+
+      String startDaysToAdd =
           isRecoveryBis ? getRecoveryCertPVStartDay() : getRecoveryCertStartDayUnified(countryCode);
 
-
+      LocalDate certificateValidUntil = lastRecovery.getDu();
+      LocalDate dateOfFirstPositiveTest =
+          lastRecovery.getFr().plusDays(Long.parseLong(endDaysToAdd));
 
       LocalDate startDate = lastRecovery.getDf();
-      LocalDate endDate = lastRecovery.getDu();
+
+      LocalDate endDate = null;
+      if (ValidationScanMode.SCHOOL.equals(validationScanMode)) {
+        if (certificateValidUntil.isBefore(dateOfFirstPositiveTest)) {
+          endDate = certificateValidUntil;
+        } else {
+          endDate = dateOfFirstPositiveTest;
+        }
+      } else {
+        startDate.plusDays(Long.parseLong(endDaysToAdd));
+      }
 
       LOG.debug("dates start:{} end:{}", startDate, endDate);
 
-
-      if ((startDate.plusDays(Long.valueOf(recoveryCertStartDay)).isAfter(LocalDate.now()))) {
+      if ((startDate.plusDays(Long.valueOf(startDaysToAdd)).isAfter(LocalDate.now()))) {
         return CertificateStatus.NOT_VALID_YET;
-      } else if (LocalDate.now().isAfter(startDate.plusDays(Long.valueOf(recoveryCertEndDay)))) {
+      } else if (LocalDate.now().isAfter(endDate)) {
         return CertificateStatus.NOT_VALID;
       } else {
         if (validationScanMode.equals(ValidationScanMode.BOOSTER_DGP)) {
@@ -402,10 +422,17 @@ public class VerifierServiceImpl implements VerifierService {
         } else if (LocalDate.now().isAfter(endDate)) {
           return CertificateStatus.NOT_VALID;
         } else {
-          return CertificateStatus.VALID;
+          if (ValidationScanMode.BOOSTER_DGP == validationScanMode
+              || ValidationScanMode.SCHOOL == validationScanMode) {
+            return CertificateStatus.NOT_VALID;
+          } else {
+            return CertificateStatus.VALID;
+          }
         }
 
-      } else if (lastVaccination.getDn() >= lastVaccination.getSd()) {
+      }
+
+      else if (lastVaccination.getDn() >= lastVaccination.getSd()) {
 
         LocalDate startDate = null;
         LocalDate endDate = null;
@@ -419,15 +446,20 @@ public class VerifierServiceImpl implements VerifierService {
 
         if (lastVaccination.getMp().equals(MedicinalProduct.JOHNSON)
             && ((lastVaccination.getDn() >= 2))
-            || !lastVaccination.getMp().equals(MedicinalProduct.JOHNSON)
-                && ((lastVaccination.getDn() >= 3))) {
+            || (!lastVaccination.getMp().equals(MedicinalProduct.JOHNSON)
+                && (lastVaccination.getDn() >= 3
+                    || lastVaccination.getDn() > lastVaccination.getSd()))) {
 
           startDaysToAdd = Long.valueOf(getVaccineStartDayBoosterUnified(countryCode));
           endDaysToAdd = Long.valueOf(getVaccineEndDayBoosterUnified(countryCode));
         } else {
           startDaysToAdd =
               Long.valueOf(getVaccineStartDayCompleteUnified(countryCode, lastVaccination.getMp()));
-          endDaysToAdd = Long.valueOf(getVaccineEndDayCompleteUnified(countryCode));
+
+          if (validationScanMode.equals(ValidationScanMode.SCHOOL))
+            endDaysToAdd = Long.parseLong(getVaccineEndDaySchool());
+          else
+            endDaysToAdd = Long.parseLong(getVaccineEndDayCompleteUnified(countryCode));
         }
 
 
@@ -720,6 +752,26 @@ public class VerifierServiceImpl implements VerifierService {
     }
   }
 
+  private String getRecoveryCertEndDaySchool() {
+    String value =
+        preferences.getValidationRuleValueByName(ValidationRulesEnum.RECOVERY_CERT_END_DAY_SCHOOL);
+    if (StringUtils.hasText(value)) {
+      return value;
+    } else {
+      return "120";
+    }
+
+  }
+
+  private String getVaccineEndDaySchool() {
+    String value =
+        preferences.getValidationRuleValueByName(ValidationRulesEnum.VACCINE_END_DAY_SCHOOL);
+    if (StringUtils.hasText(value)) {
+      return value;
+    } else {
+      return "120";
+    }
+  }
 
   private boolean isCertificateRevoked(String hash) {
     if (!preferences.isDrlSyncActive()) {
