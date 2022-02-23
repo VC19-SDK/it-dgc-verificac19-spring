@@ -33,6 +33,7 @@ import it.dgc.verificac19.model.CertCode;
 import it.dgc.verificac19.model.CertificateSimple;
 import it.dgc.verificac19.model.CertificateSimple.SimplePersonModel;
 import it.dgc.verificac19.model.CertificateStatus;
+import it.dgc.verificac19.model.Const;
 import it.dgc.verificac19.model.Country;
 import it.dgc.verificac19.model.Exemption;
 import it.dgc.verificac19.model.TestResult;
@@ -72,7 +73,7 @@ public class VerifierServiceImpl implements VerifierService {
           public List<X509Certificate> getCertificates(String country, byte[] kid) {
             String base64Kid = Base64.encodeBase64String(kid);
             cert = (X509Certificate) verifierRepository.getCertificate(base64Kid);
-            return cert != null ? Arrays.asList(cert) : Lists.newArrayList();
+            return cert != null ? Lists.newArrayList(cert) : Lists.newArrayList();
           }
         }, new DefaultBarcodeDecoder());
 
@@ -227,16 +228,16 @@ public class VerifierServiceImpl implements VerifierService {
 
     if (!CollectionUtils.isEmpty(cert.getT())) {
       if (validationScanMode.equals(ValidationScanMode.BOOSTER_DGP)
-          || validationScanMode.equals(ValidationScanMode.SUPER_DGP)
-          || validationScanMode.equals(ValidationScanMode.SCHOOL)) {
+          || validationScanMode.equals(ValidationScanMode.SUPER_DGP)) {
         return CertificateStatus.NOT_VALID;
       }
 
-      return checkTests(cert.getT());
+      return checkTests(cert.getT(), validationScanMode, cert.getDateOfBirth().asLocalDate());
     }
 
     if (!CollectionUtils.isEmpty(cert.getV())) {
-      return checkVaccinations(cert.getV(), validationScanMode);
+      return checkVaccinations(cert.getV(), validationScanMode,
+          cert.getDateOfBirth().asLocalDate());
     }
 
     if (!CollectionUtils.isEmpty(cert.getE())) {
@@ -273,11 +274,13 @@ public class VerifierServiceImpl implements VerifierService {
 
       if (endDate != null) {
         if (LocalDate.now().isAfter(endDate)) {
-          return CertificateStatus.NOT_VALID;
+          return CertificateStatus.EXPIRED;
         }
       }
 
-      if (validationScanMode.equals(ValidationScanMode.BOOSTER_DGP)) {
+      if (validationScanMode.equals(ValidationScanMode.ENTRY_ITALY)) {
+        return CertificateStatus.NOT_VALID;
+      } else if (validationScanMode.equals(ValidationScanMode.BOOSTER_DGP)) {
         return CertificateStatus.TEST_NEEDED;
       } else {
         return CertificateStatus.VALID;
@@ -302,18 +305,14 @@ public class VerifierServiceImpl implements VerifierService {
 
       boolean isRecoveryBis = isRecoveryBis(list, validationScanMode);
 
-      RecoveryEntry lastRecovery = Iterables.getLast(list);
+      RecoveryEntry firstRecovery = Iterables.getFirst(list, null);
 
       String countryCode =
-          validationScanMode == ValidationScanMode.NORMAL_DGP ? lastRecovery.getCo()
+          validationScanMode == ValidationScanMode.ENTRY_ITALY ? firstRecovery.getCo()
               : Country.IT.getValue();
 
-
-
       String endDaysToAdd = null;
-      if (validationScanMode.equals(ValidationScanMode.SCHOOL)) {
-        endDaysToAdd = getRecoveryCertEndDaySchool();
-      } else if (isRecoveryBis) {
+      if (isRecoveryBis) {
         endDaysToAdd = getRecoveryCertPvEndDay();
       } else {
         endDaysToAdd = getRecoveryCertEndDayUnified(countryCode);
@@ -323,31 +322,18 @@ public class VerifierServiceImpl implements VerifierService {
       String startDaysToAdd =
           isRecoveryBis ? getRecoveryCertPVStartDay() : getRecoveryCertStartDayUnified(countryCode);
 
-      LocalDate certificateValidUntil = lastRecovery.getDu();
-      LocalDate dateOfFirstPositiveTest =
-          lastRecovery.getFr().plusDays(Long.parseLong(endDaysToAdd));
+      LocalDate startDate = firstRecovery.getDf();
 
-      LocalDate startDate = lastRecovery.getDf();
-
-      LocalDate endDate = null;
-      if (ValidationScanMode.SCHOOL.equals(validationScanMode)) {
-        if (certificateValidUntil.isBefore(dateOfFirstPositiveTest)) {
-          endDate = certificateValidUntil;
-        } else {
-          endDate = dateOfFirstPositiveTest;
-        }
-      } else {
-        startDate.plusDays(Long.parseLong(endDaysToAdd));
-      }
+      LocalDate endDate = startDate.plusDays(Long.parseLong(endDaysToAdd));
 
       LOG.debug("dates start:{} end:{}", startDate, endDate);
 
-      if ((startDate.plusDays(Long.valueOf(startDaysToAdd)).isAfter(LocalDate.now()))) {
+      if ((startDate.plusDays(Long.parseLong(startDaysToAdd)).isAfter(LocalDate.now()))) {
         return CertificateStatus.NOT_VALID_YET;
       } else if (LocalDate.now().isAfter(endDate)) {
-        return CertificateStatus.NOT_VALID;
+        return CertificateStatus.EXPIRED;
       } else {
-        if (validationScanMode.equals(ValidationScanMode.BOOSTER_DGP)) {
+        if (validationScanMode.equals(ValidationScanMode.BOOSTER_DGP) && !isRecoveryBis) {
           return CertificateStatus.TEST_NEEDED;
         } else {
           return CertificateStatus.VALID;
@@ -364,7 +350,8 @@ public class VerifierServiceImpl implements VerifierService {
       throws CertificateParsingException {
 
     RecoveryEntry firstRecovery = Iterables.getFirst(list, null);
-    if (firstRecovery != null && Country.IT.getValue().equals(firstRecovery.getCo())) {
+    if (firstRecovery != null && Country.IT.getValue().equals(firstRecovery.getCo())
+        && cert.getExtendedKeyUsage() != null) {
       List<String> keysUsage = cert.getExtendedKeyUsage();
       Iterator<String> it = keysUsage.iterator();
       while (it.hasNext()) {
@@ -386,128 +373,296 @@ public class VerifierServiceImpl implements VerifierService {
    * the proper status as [CertificateStatus].
    * 
    * @param validationScanMode
+   * @param birthDate
    *
    */
   private CertificateStatus checkVaccinations(List<VaccinationEntry> list,
-      ValidationScanMode validationScanMode) {
+      ValidationScanMode validationScanMode, LocalDate birthDate) {
 
     VaccinationEntry lastVaccination = Iterables.getLast(list);
 
-    // Check if vaccine is present in setting list; otherwise, return not valid
-    String vaccineEndDayComplete = getVaccineEndDayComplete(lastVaccination.getMp());
-
-    boolean isValid = !vaccineEndDayComplete.isEmpty();
-    if (!isValid) {
+    if (isNotComplete(lastVaccination.getDn(), lastVaccination.getSd())
+        && !isEMA(lastVaccination.getMp(), lastVaccination.getCo()))
       return CertificateStatus.NOT_VALID;
-    }
 
-    boolean isSputnikNotFromSanMarino =
-        lastVaccination.getMp().equals("Sputnik-V") && !lastVaccination.getCo().equals("SM");
-    if (isSputnikNotFromSanMarino) {
-      return CertificateStatus.NOT_VALID;
-    }
 
     try {
-      if (lastVaccination.getDn() < lastVaccination.getSd()) {
-
-        LocalDate startDate = lastVaccination.getDt()
-            .plusDays(Long.valueOf(getVaccineStartDayNotComplete(lastVaccination.getMp())));
-        LocalDate endDate = lastVaccination.getDt()
-            .plusDays(Long.valueOf(getVaccineEndDayNotComplete(lastVaccination.getMp())));
-
-        LOG.debug("dates start:{} end: {}", startDate, endDate);
-
-        if (startDate.isAfter(LocalDate.now())) {
-          return CertificateStatus.NOT_VALID_YET;
-        } else if (LocalDate.now().isAfter(endDate)) {
-          return CertificateStatus.NOT_VALID;
-        } else {
-          if (ValidationScanMode.BOOSTER_DGP == validationScanMode
-              || ValidationScanMode.SCHOOL == validationScanMode) {
-            return CertificateStatus.NOT_VALID;
-          } else {
-            return CertificateStatus.VALID;
-          }
-        }
-
-      }
-
-      else if (lastVaccination.getDn() >= lastVaccination.getSd()) {
-
-        LocalDate startDate = null;
-        LocalDate endDate = null;
-
-        Long startDaysToAdd;
-        Long endDaysToAdd;
-
-        String countryCode =
-            validationScanMode == ValidationScanMode.NORMAL_DGP ? lastVaccination.getCo()
-                : Country.IT.getValue();
-
-        if (lastVaccination.getMp().equals(MedicinalProduct.JOHNSON)
-            && ((lastVaccination.getDn() >= 2))
-            || (!lastVaccination.getMp().equals(MedicinalProduct.JOHNSON)
-                && (lastVaccination.getDn() >= 3
-                    || lastVaccination.getDn() > lastVaccination.getSd()))) {
-
-          startDaysToAdd = Long.valueOf(getVaccineStartDayBoosterUnified(countryCode));
-          endDaysToAdd = Long.valueOf(getVaccineEndDayBoosterUnified(countryCode));
-        } else {
-          startDaysToAdd =
-              Long.valueOf(getVaccineStartDayCompleteUnified(countryCode, lastVaccination.getMp()));
-
-          if (validationScanMode.equals(ValidationScanMode.SCHOOL))
-            endDaysToAdd = Long.parseLong(getVaccineEndDaySchool());
-          else
-            endDaysToAdd = Long.parseLong(getVaccineEndDayCompleteUnified(countryCode));
-        }
-
-
-        startDate = lastVaccination.getDt().plusDays(startDaysToAdd);
-        endDate = lastVaccination.getDt().plusDays(endDaysToAdd);
-
-        LOG.debug("dates start:{} end: {}", startDate, endDate);
-
-        if (startDate.isAfter(LocalDate.now())) {
-          return CertificateStatus.NOT_VALID_YET;
-        }
-        if (LocalDate.now().isAfter(endDate)) {
-          return CertificateStatus.NOT_VALID;
-        } else {
-
-          if (validationScanMode == ValidationScanMode.BOOSTER_DGP) {
-            if (lastVaccination.getMp().equals(MedicinalProduct.JOHNSON)) {
-              if (lastVaccination.getDn() == lastVaccination.getSd() && lastVaccination.getDn() < 2)
-                return CertificateStatus.TEST_NEEDED;
-            } else {
-              if ((lastVaccination.getDn() == lastVaccination.getSd()
-                  && lastVaccination.getDn() < 3))
-                return CertificateStatus.TEST_NEEDED;
-            }
-            return CertificateStatus.VALID;
-          } else {
-            return CertificateStatus.VALID;
-          }
-        }
-
-      } else {
-        return CertificateStatus.NOT_VALID;
-      }
+      return validateVaccinationsWithScanMode(lastVaccination, validationScanMode, birthDate);
     } catch (Exception e) {
       return CertificateStatus.NOT_EU_DCC;
     }
   }
 
+  private CertificateStatus validateVaccinationsWithScanMode(VaccinationEntry lastVaccination,
+      ValidationScanMode validationScanMode, LocalDate birthDate) {
+    if (ValidationScanMode.NORMAL_DGP.equals(validationScanMode)) {
+      return vaccineStandardStrategy(lastVaccination);
+    } else if (ValidationScanMode.SUPER_DGP.equals(validationScanMode)) {
+      return vaccineStrengthenedStrategy(lastVaccination);
+    } else if (ValidationScanMode.BOOSTER_DGP.equals(validationScanMode)) {
+      return vaccineBoosterStrategy(lastVaccination);
+    } else if (ValidationScanMode.WORK.equals(validationScanMode)) {
+      return vaccineWorkStrategy(lastVaccination, birthDate);
+    } else if (ValidationScanMode.ENTRY_ITALY.equals(validationScanMode)) {
+      return vaccineEntryItalyStrategy(lastVaccination);
+    } else {
+      return CertificateStatus.NOT_EU_DCC;
+    }
+  }
+
+  private CertificateStatus vaccineEntryItalyStrategy(VaccinationEntry lastVaccination) {
+    LocalDate dateOfVaccination = lastVaccination.getDt();
+
+    String startDaysToAdd;
+    if (isBooster(lastVaccination.getMp(), lastVaccination.getDn(), lastVaccination.getSd())) {
+      startDaysToAdd = getVaccineStartDayBoosterUnified(Country.NOT_IT.getValue());
+    } else {
+      startDaysToAdd =
+          getVaccineStartDayCompleteUnified(Country.NOT_IT.getValue(), lastVaccination.getMp());
+    }
+
+
+    String endDaysToAdd;
+    if (isBooster(lastVaccination.getMp(), lastVaccination.getDn(), lastVaccination.getSd())) {
+      endDaysToAdd = getVaccineEndDayBoosterUnified(Country.NOT_IT.getValue());
+    } else {
+      endDaysToAdd = getVaccineEndDayCompleteUnified(Country.NOT_IT.getValue());
+    }
+
+
+
+    LocalDate startDate = dateOfVaccination.plusDays(Long.parseLong(startDaysToAdd));
+    LocalDate endDate = dateOfVaccination.plusDays(Long.parseLong(endDaysToAdd));
+
+    if (LocalDate.now().isBefore(startDate))
+      return CertificateStatus.NOT_VALID_YET;
+    else if (LocalDate.now().isAfter(endDate))
+      return CertificateStatus.EXPIRED;
+    else if (!isEMA(lastVaccination.getMp(), lastVaccination.getCo()))
+      return CertificateStatus.NOT_VALID;
+    else
+      return CertificateStatus.VALID;
+
+  }
+
+  private CertificateStatus vaccineWorkStrategy(VaccinationEntry lastVaccination,
+      LocalDate birthDate) {
+
+    int age = Utility.getAge(birthDate);
+
+    if (age >= Const.VACCINE_MANDATORY_AGE) {
+      return vaccineStrengthenedStrategy(lastVaccination);
+    } else {
+      return vaccineStandardStrategy(lastVaccination);
+    }
+
+  }
+
+  private CertificateStatus vaccineBoosterStrategy(VaccinationEntry lastVaccination) {
+    LocalDate dateOfVaccination = lastVaccination.getDt();
+
+    String startDaysToAdd;
+    if (isBooster(lastVaccination.getMp(), lastVaccination.getDn(), lastVaccination.getSd())) {
+      startDaysToAdd = getVaccineStartDayBoosterUnified(Country.IT.getValue());
+    } else if (isNotComplete(lastVaccination.getDn(), lastVaccination.getSd())) {
+      startDaysToAdd = getVaccineStartDayNotComplete(lastVaccination.getMp());
+    } else {
+      startDaysToAdd =
+          getVaccineStartDayCompleteUnified(Country.IT.getValue(), lastVaccination.getMp());
+    }
+
+    String endDaysToAdd;
+    if (isBooster(lastVaccination.getMp(), lastVaccination.getDn(), lastVaccination.getSd())) {
+      endDaysToAdd = getVaccineEndDayBoosterUnified(Country.IT.getValue());
+    } else if (isNotComplete(lastVaccination.getDn(), lastVaccination.getSd())) {
+      endDaysToAdd = getVaccineEndDayNotComplete(lastVaccination.getMp());
+    } else {
+
+      endDaysToAdd = getVaccineEndDayCompleteUnified(Country.IT.getValue());
+    }
+
+    LocalDate startDate = dateOfVaccination.plusDays(Long.parseLong(startDaysToAdd));
+    LocalDate endDate = dateOfVaccination.plusDays(Long.parseLong(endDaysToAdd));
+
+    if (LocalDate.now().isBefore(startDate))
+      return CertificateStatus.NOT_VALID_YET;
+    else if (LocalDate.now().isAfter(endDate))
+      return CertificateStatus.EXPIRED;
+    else if (isComplete(lastVaccination.getDn(), lastVaccination.getSd())) {
+      if (isBooster(lastVaccination.getMp(), lastVaccination.getDn(), lastVaccination.getSd())) {
+        if (isEMA(lastVaccination.getMp(), lastVaccination.getCo())) {
+          return CertificateStatus.VALID;
+        } else
+          return CertificateStatus.TEST_NEEDED;
+      } else
+        return CertificateStatus.TEST_NEEDED;
+    } else
+      return CertificateStatus.NOT_VALID;
+
+  }
+
+  private CertificateStatus vaccineStrengthenedStrategy(VaccinationEntry lastVaccination) {
+    LocalDate startDate = null;
+    LocalDate endDate = null;
+    LocalDate extendedDate = null;
+
+    String country = lastVaccination.getCo();
+    LocalDate dateOfVaccination = lastVaccination.getDt();
+
+    if (Country.IT.getValue().equals(country)) {
+      return vaccineStandardStrategy(lastVaccination);
+    } else {
+
+      if (isNotComplete(lastVaccination.getDn(), lastVaccination.getSd())) {
+        if (isEMA(lastVaccination.getMp(), lastVaccination.getCo())) {
+          startDate = dateOfVaccination.plusDays(Long.parseLong(lastVaccination.getMp()));
+          endDate = dateOfVaccination
+              .plusDays(Long.parseLong(getVaccineEndDayNotComplete(lastVaccination.getMp())));
+        } else {
+          return CertificateStatus.NOT_VALID;
+        }
+      }
+
+      if (isComplete(lastVaccination.getDn(), lastVaccination.getSd())) {
+        String startDaysToAdd;
+        if (isBooster(lastVaccination.getMp(), lastVaccination.getDn(), lastVaccination.getSd())) {
+          startDaysToAdd = getVaccineStartDayBoosterUnified(Country.IT.getValue());
+        } else {
+          startDaysToAdd =
+              getVaccineStartDayCompleteUnified(Country.IT.getValue(), lastVaccination.getMp());
+        }
+
+        String endDaysToAdd;
+        if (isBooster(lastVaccination.getMp(), lastVaccination.getDn(), lastVaccination.getSd())) {
+          endDaysToAdd = getVaccineEndDayBoosterUnified(Country.IT.getValue());
+        } else {
+          endDaysToAdd = getVaccineEndDayCompleteUnified(Country.IT.getValue());
+        }
+
+        String extendedDaysToAdd = getVaccineEndDayCompleteExtendedEMA();
+
+        startDate = dateOfVaccination.plusDays(Long.parseLong(startDaysToAdd));
+        endDate = dateOfVaccination.plusDays(Long.parseLong(endDaysToAdd));
+        extendedDate = dateOfVaccination.plusDays(Long.parseLong(extendedDaysToAdd));
+      }
+    }
+
+
+
+    if (isNotComplete(lastVaccination.getDn(), lastVaccination.getSd())) {
+
+      if (!isEMA(lastVaccination.getMp(), country))
+        return CertificateStatus.NOT_VALID;
+      else if (LocalDate.now().isBefore(startDate))
+        return CertificateStatus.NOT_VALID_YET;
+      else if (LocalDate.now().isAfter(endDate))
+        return CertificateStatus.EXPIRED;
+      else
+        return CertificateStatus.VALID;
+
+    }
+    if (isBooster(lastVaccination.getMp(), lastVaccination.getDn(), lastVaccination.getSd())) {
+
+      if (LocalDate.now().isBefore(startDate))
+        return CertificateStatus.NOT_VALID_YET;
+      else if (LocalDate.now().isAfter(endDate))
+        return CertificateStatus.EXPIRED;
+      else {
+        if (isEMA(lastVaccination.getMp(), lastVaccination.getCo()))
+          return CertificateStatus.VALID;
+        else
+          return CertificateStatus.TEST_NEEDED;
+      }
+    }
+
+    else {
+
+      if (isEMA(lastVaccination.getMp(), lastVaccination.getCo())) {
+
+        if (LocalDate.now().isBefore(startDate))
+          return CertificateStatus.NOT_VALID_YET;
+
+        if (LocalDate.now().isBefore(endDate) || !LocalDate.now().isAfter(endDate))
+          return CertificateStatus.VALID;
+        if (LocalDate.now().isBefore(extendedDate) || !LocalDate.now().isAfter(extendedDate))
+          return CertificateStatus.TEST_NEEDED;
+        else
+          return CertificateStatus.EXPIRED;
+
+
+      } else {
+        if (LocalDate.now().isBefore(startDate))
+          return CertificateStatus.NOT_VALID_YET;
+        else if (LocalDate.now().isBefore(extendedDate) || !LocalDate.now().isAfter(extendedDate))
+          return CertificateStatus.TEST_NEEDED;
+        else
+          return CertificateStatus.EXPIRED;
+      }
+
+
+    }
+
+  }
+
+  private CertificateStatus vaccineStandardStrategy(VaccinationEntry lastVaccination) {
+
+    LocalDate dateOfVaccination = lastVaccination.getDt();
+
+    LocalDate startDate;
+    if (isComplete(lastVaccination.getDn(), lastVaccination.getSd())) {
+      String startDaysToAdd;
+      if (isBooster(lastVaccination.getMp(), lastVaccination.getDn(), lastVaccination.getSd())) {
+        startDaysToAdd = getVaccineStartDayBoosterUnified(Country.IT.getValue());
+      } else {
+        startDaysToAdd =
+            getVaccineStartDayCompleteUnified(Country.IT.getValue(), lastVaccination.getMp());
+      }
+      startDate = dateOfVaccination.plusDays(Long.parseLong(startDaysToAdd));
+    } else {
+      startDate = dateOfVaccination
+          .plusDays(Long.parseLong(getVaccineStartDayNotComplete(lastVaccination.getMp())));
+    }
+
+
+    LocalDate endDate;
+    if (isComplete(lastVaccination.getDn(), lastVaccination.getSd())) {
+      String endDaysToAdd;
+      if (isBooster(lastVaccination.getMp(), lastVaccination.getDn(), lastVaccination.getSd())) {
+        endDaysToAdd = getVaccineEndDayBoosterUnified(Country.IT.getValue());
+      } else {
+        endDaysToAdd = getVaccineEndDayCompleteUnified(Country.IT.getValue());
+      }
+      endDate = dateOfVaccination.plusDays(Long.parseLong(endDaysToAdd));
+    } else {
+        endDate = dateOfVaccination
+                .plusDays(Long.parseLong(getVaccineEndDayNotComplete(lastVaccination.getMp())));
+    }
+
+    if (LocalDate.now().isBefore(startDate))
+      return CertificateStatus.NOT_VALID_YET;
+    else if (LocalDate.now().isAfter(endDate))
+      return CertificateStatus.EXPIRED;
+    else if (!isEMA(lastVaccination.getMp(), lastVaccination.getCo()))
+      return CertificateStatus.NOT_VALID;
+    else
+      return CertificateStatus.VALID;
+  }
+
+
+
   /**
    *
    * This method checks the given tests passed as a [List] of [TestModel] and returns the proper
    * status as [CertificateStatus].
+   * 
+   * @param validationScanMode
    *
    */
-  private CertificateStatus checkTests(List<TestEntry> list) {
+  private CertificateStatus checkTests(List<TestEntry> list, ValidationScanMode validationScanMode,
+      LocalDate birthDate) {
 
     TestEntry lastTest = Iterables.getLast(list);
-    if (lastTest.getTr() == TestResult.DETECTED.getValue()) {
+    if (lastTest.getTr().equals(TestResult.DETECTED.getValue())) {
       return CertificateStatus.NOT_VALID;
     }
 
@@ -521,11 +676,11 @@ public class VerifierServiceImpl implements VerifierService {
       LocalDateTime endDate = null;
 
       if (testType.equals(TestType.MOLECULAR.getValue())) {
-        startDate = ldtDateTimeOfCollection.plusHours(Long.valueOf(getMolecularTestStartHour()));
-        endDate = ldtDateTimeOfCollection.plusHours(Long.valueOf(getMolecularTestEndHour()));
+        startDate = ldtDateTimeOfCollection.plusHours(Long.parseLong(getMolecularTestStartHour()));
+        endDate = ldtDateTimeOfCollection.plusHours(Long.parseLong(getMolecularTestEndHour()));
       } else if (testType.equals(TestType.RAPID.getValue())) {
-        startDate = ldtDateTimeOfCollection.plusHours(Long.valueOf(getRapidTestStartHour()));
-        endDate = ldtDateTimeOfCollection.plusHours(Long.valueOf(getRapidTestEndHour()));
+        startDate = ldtDateTimeOfCollection.plusHours(Long.parseLong(getRapidTestStartHour()));
+        endDate = ldtDateTimeOfCollection.plusHours(Long.parseLong(getRapidTestEndHour()));
       } else {
         return CertificateStatus.NOT_VALID;
       }
@@ -537,7 +692,13 @@ public class VerifierServiceImpl implements VerifierService {
       } else if (LocalDateTime.now().isAfter(endDate)) {
         return CertificateStatus.NOT_VALID;
       } else {
-        return CertificateStatus.VALID;
+
+        if (Utility.getAge(birthDate) >= Const.VACCINE_MANDATORY_AGE
+            && ValidationScanMode.WORK.equals(validationScanMode))
+          return CertificateStatus.NOT_VALID;
+        else
+          return CertificateStatus.VALID;
+
       }
 
     } catch (Exception e) {
@@ -574,17 +735,30 @@ public class VerifierServiceImpl implements VerifierService {
     return "";
   }
 
-  // private String getRecoveryCertStartDay() {
-  // return preferences.getValidationRuleValueByName(ValidationRulesEnum.RECOVERY_CERT_START_DAY);
-  // }
+
+  private boolean isCertificateRevoked(String hash) {
+    if (!preferences.isDrlSyncActive()) {
+      return false;
+    }
+
+    if (StringUtils.hasText(hash)) {
+
+      LOG.debug("Revoke", "Searching");
+      boolean isFound = verifierRepository.checkInRevokedList(hash);
+
+      if (isFound) {
+        LOG.info("Revoke Pass hash: " + hash + " found!");
+        return true;
+      } else
+        return false;
+    } else {
+      return true;
+    }
+  }
 
   private String getRecoveryCertPVStartDay() {
     return preferences.getValidationRuleValueByName(ValidationRulesEnum.RECOVERY_CERT_PV_START_DAY);
   }
-
-  // private String getRecoveryCertEndDay() {
-  // return preferences.getValidationRuleValueByName(ValidationRulesEnum.RECOVERY_CERT_END_DAY);
-  // }
 
   private String getRecoveryCertPvEndDay() {
     return preferences.getValidationRuleValueByName(ValidationRulesEnum.RECOVERY_CERT_PV_END_DAY);
@@ -616,31 +790,29 @@ public class VerifierServiceImpl implements VerifierService {
         ValidationRulesEnum.VACCINE_END_DAY_NOT_COMPLETE, vaccineType);
   }
 
-  // private String getVaccineStartDayComplete(String vaccineType) {
-  // return preferences.getValidationRuleValueByNameAndType(
-  // ValidationRulesEnum.VACCINE_START_DAY_COMPLETE, vaccineType);
-  // }
 
-  private String getVaccineEndDayComplete(String vaccineType) {
+  private String getVaccineStartDayComplete(String vaccineType) {
     return preferences.getValidationRuleValueByNameAndType(
-        ValidationRulesEnum.VACCINE_END_DAY_COMPLETE, vaccineType);
+        ValidationRulesEnum.VACCINE_START_DAY_COMPLETE, vaccineType);
   }
 
   private String getVaccineStartDayCompleteUnified(String countryCode, String medicalProduct) {
-    int daysToAdd = MedicinalProduct.JOHNSON.equalsIgnoreCase(medicalProduct) ? 15 : 0;
+    int daysToAdd = MedicinalProduct.JANSEN.equals(medicalProduct)
+        ? Integer.parseInt(getVaccineStartDayComplete(MedicinalProduct.JANSEN))
+        : Const.NO_VALUE_NUMBER;
 
     int startDay = 0;
     if (Country.IT.getValue().equals(countryCode)) {
       String value = preferences
           .getValidationRuleValueByName(ValidationRulesEnum.VACCINE_START_DAY_COMPLETE_IT);
       if (StringUtils.hasText(value)) {
-        startDay = Integer.valueOf(value);
+        startDay = Integer.parseInt(value);
       }
     } else {
       String value = preferences
           .getValidationRuleValueByName(ValidationRulesEnum.VACCINE_START_DAY_COMPLETE_NOT_IT);
       if (StringUtils.hasText(value)) {
-        startDay = Integer.valueOf(value);
+        startDay = Integer.parseInt(value);
       }
     }
 
@@ -752,45 +924,52 @@ public class VerifierServiceImpl implements VerifierService {
     }
   }
 
-  private String getRecoveryCertEndDaySchool() {
-    String value =
-        preferences.getValidationRuleValueByName(ValidationRulesEnum.RECOVERY_CERT_END_DAY_SCHOOL);
+  private String getVaccineEndDayCompleteExtendedEMA() {
+    String value = preferences
+        .getValidationRuleValueByName(ValidationRulesEnum.VACCINE_END_DAY_COMPLETE_EXTENDED_EMA);
     if (StringUtils.hasText(value)) {
       return value;
     } else {
-      return "120";
-    }
-
-  }
-
-  private String getVaccineEndDaySchool() {
-    String value =
-        preferences.getValidationRuleValueByName(ValidationRulesEnum.VACCINE_END_DAY_SCHOOL);
-    if (StringUtils.hasText(value)) {
-      return value;
-    } else {
-      return "120";
+      return Const.NO_VALUE_TEXT;
     }
   }
 
-  private boolean isCertificateRevoked(String hash) {
-    if (!preferences.isDrlSyncActive()) {
-      return false;
+  private boolean isEMA(String medicinalProduct, String countryOfVaccination) {
+    boolean isStandardEma = false;
+
+    String values = preferences.getValidationRuleValueByName(ValidationRulesEnum.EMA_VACCINES);
+    String[] arrayValues;
+    if (values != null) {
+      arrayValues = values.split(";");
+      isStandardEma = Arrays.asList(arrayValues).contains(medicinalProduct);
     }
 
-    if (StringUtils.hasText(hash)) {
 
-      LOG.debug("Revoke", "Searching");
-      boolean isFound = verifierRepository.checkInRevokedList(hash);
+    // also Sputnik is EMA, but only if from San Marino
+    boolean isSpecialEma = MedicinalProduct.SPUTNIK.equals(medicinalProduct)
+        && Country.SM.getValue().equals(countryOfVaccination);
 
-      if (isFound) {
-        LOG.info("Revoke Pass hash: " + hash + " found!");
-        return true;
-      } else
-        return false;
+    return isStandardEma || isSpecialEma;
+  }
+
+  private boolean isComplete(int doseNumber, int totalSeriesOfDoses) {
+    return doseNumber >= totalSeriesOfDoses;
+  }
+
+  private boolean isNotComplete(int doseNumber, int totalSeriesOfDoses) {
+    return doseNumber < totalSeriesOfDoses;
+  }
+
+  private boolean isBooster(String medicinalProduct, int doseNumber, int totalSeriesOfDoses) {
+    if (isJansen(medicinalProduct)) {
+      return doseNumber >= 2;
     } else {
-      return true;
+      return doseNumber >= 3 || doseNumber > totalSeriesOfDoses;
     }
+  }
+
+  private boolean isJansen(String medicinalProduct) {
+    return MedicinalProduct.JANSEN.equals(medicinalProduct);
   }
 
 }
